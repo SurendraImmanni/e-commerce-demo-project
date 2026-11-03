@@ -1,0 +1,8 @@
+aws_region       = "ap-south-1"
+project_name     = "cloudcart"
+environment      = "dev"
+cluster_version  = "1.33"
+node_desired_size = 2
+node_min_size     = 2
+node_max_size     = 3
+enable_nat_gateway = true

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudCart Demo Store</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">CloudCart</a>
+    <div class="cart-summary">Cart: <strong id="cart-count">0</strong> item(s)</div>
+  </header>
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">A DevSecOps demo application</p>
+      <h1>Useful things, simply shopped.</h1>
+      <p>This sample storefront demonstrates a Node.js application deployed to Kubernetes.</p>
+    </section>
+    <section>
+      <h2>Featured products</h2>
+      <div id="products" class="product-grid" aria-live="polite"></div>
+    </section>
+    <section class="cart-panel">
+      <h2>Your cart</h2>
+      <div id="cart-items">Your cart is empty.</div>
+      <button id="checkout" class="button" disabled>Demo checkout</button>
+      <p id="checkout-message" role="status"></p>
+    </section>
+  </main>
+  <footer>CloudCart sample app · No real payments or orders</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

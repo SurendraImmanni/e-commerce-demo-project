@@ -1,0 +1,53 @@
+name: Manual rollback
+
+# Use this when a bad release gets past the automatic checks and you notice later.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Deployment revision to roll back to (leave empty for the previous one)"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    name: Roll back cloudcart deployment
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.33.0"
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "${{ vars.AWS_REGION }}" --name "${{ vars.EKS_CLUSTER_NAME }}"
+
+      - name: Show rollout history
+        run: kubectl rollout history deployment/cloudcart -n cloudcart
+
+      - name: Roll back
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          if [[ -n "$REVISION" && ! "$REVISION" =~ ^[0-9]+$ ]]; then
+            echo "::error::revision must be a number"; exit 1
+          fi
+          if [ -n "$REVISION" ]; then
+            kubectl rollout undo deployment/cloudcart -n cloudcart --to-revision="$REVISION"
+          else
+            kubectl rollout undo deployment/cloudcart -n cloudcart
+          fi
+          kubectl rollout status deployment/cloudcart -n cloudcart --timeout=300s
+          kubectl get deployment,pods -n cloudcart
+          kubectl get deployment cloudcart -n cloudcart -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'

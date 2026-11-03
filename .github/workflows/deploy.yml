@@ -1,0 +1,274 @@
+name: Build, scan, push and deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "kubernetes/**"
+      - "sonar-project.properties"
+      - ".github/workflows/deploy.yml"
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+concurrency:
+  group: cloudcart-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1-2. Fetch code, install SonarQube (ephemeral container), scan, gate
+  # ---------------------------------------------------------------------------
+  test-and-scan:
+    name: Test and SonarQube scan
+    runs-on: ubuntu-latest
+    env:
+      SONAR_HOST_URL: http://localhost:9000
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        working-directory: app
+        run: npm run test:coverage
+
+      - name: Install and start SonarQube
+        run: |
+          # SonarQube's embedded Elasticsearch needs a higher mmap limit.
+          sudo sysctl -w vm.max_map_count=524288
+          sudo sysctl -w fs.file-max=131072
+          docker run -d --name sonarqube -p 9000:9000 sonarqube:community
+
+      - name: Wait for SonarQube, set admin password, create token
+        run: |
+          for i in $(seq 1 60); do
+            STATUS="$(curl -s "$SONAR_HOST_URL/api/system/status" | jq -r '.status' 2>/dev/null || true)"
+            echo "SonarQube status: ${STATUS:-starting}"
+            [ "$STATUS" = "UP" ] && break
+            sleep 5
+          done
+          [ "$STATUS" = "UP" ] || { docker logs sonarqube | tail -50; exit 1; }
+
+          ADMIN_PASS="$(openssl rand -hex 16)Aa1!"
+          echo "::add-mask::$ADMIN_PASS"
+          curl -sf -u admin:admin -X POST "$SONAR_HOST_URL/api/users/change_password" \
+            --data-urlencode "login=admin" \
+            --data-urlencode "previousPassword=admin" \
+            --data-urlencode "password=$ADMIN_PASS"
+
+          TOKEN="$(curl -sf -u "admin:$ADMIN_PASS" -X POST "$SONAR_HOST_URL/api/user_tokens/generate" \
+            --data-urlencode "name=ci-$GITHUB_RUN_ID" | jq -r '.token')"
+          echo "::add-mask::$TOKEN"
+          echo "SONAR_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "SONAR_ADMIN_PASS=$ADMIN_PASS" >> "$GITHUB_ENV"
+
+      - name: SonarQube scan and quality gate
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          projectBaseDir: .
+          # Fails this step (and the pipeline) if the quality gate fails.
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      - name: Export SonarQube findings
+        if: always()
+        run: |
+          curl -s -u "admin:$SONAR_ADMIN_PASS" \
+            "$SONAR_HOST_URL/api/issues/search?componentKeys=cloudcart-ecommerce&ps=500" \
+            -o sonar-issues.json || true
+          curl -s -u "admin:$SONAR_ADMIN_PASS" \
+            "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=cloudcart-ecommerce" \
+            -o sonar-quality-gate.json || true
+
+      - name: Upload SonarQube findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-report
+          path: |
+            sonar-issues.json
+            sonar-quality-gate.json
+          if-no-files-found: ignore
+
+      - name: Stop SonarQube
+        if: always()
+        run: docker rm -f sonarqube || true
+
+  # ---------------------------------------------------------------------------
+  # 3-4. Build image, Trivy scan, push to ECR
+  # ---------------------------------------------------------------------------
+  build-scan-push:
+    name: Build, Trivy scan and push image
+    needs: test-and-scan
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.ecr.outputs.image_uri }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve ECR repository
+        id: ecr
+        run: |
+          REPOSITORY="${{ vars.ECR_REPOSITORY }}"
+          if [ -z "$REPOSITORY" ]; then
+            echo "Set the ECR_REPOSITORY repository variable to the Terraform ECR repository name."
+            exit 1
+          fi
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com"
+          echo "image_uri=$REGISTRY/$REPOSITORY:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: docker build --pull -t "${{ steps.ecr.outputs.image_uri }}" ./app
+
+      # SECURITY: trivy-action is pinned to a full commit SHA (tag v0.35.0).
+      # In March 2026 attackers force-pushed malicious code to most trivy-action
+      # version tags (including the old un-prefixed "0.28.0" style). v0.35.0 is the
+      # vendor-declared safe release. Never reference this action by a mutable tag.
+      - name: Scan image with Trivy (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.image_uri }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Generate Trivy SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.image_uri }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload Trivy SARIF report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+      - name: Push image to ECR
+        run: docker push "${{ steps.ecr.outputs.image_uri }}"
+
+  # ---------------------------------------------------------------------------
+  # 6-7. Deploy to EKS with automatic rollback
+  # ---------------------------------------------------------------------------
+  deploy-to-eks:
+    name: Deploy to EKS (auto-rollback)
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.33.0"
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "${{ vars.AWS_REGION }}" --name "${{ vars.EKS_CLUSTER_NAME }}"
+
+      - name: Verify cluster and nodes
+        run: |
+          kubectl get nodes
+          kubectl wait --for=condition=Ready nodes --all --timeout=10m
+
+      - name: Record currently running revision (rollback target)
+        id: current
+        run: |
+          REV="$(kubectl get deployment cloudcart -n cloudcart \
+            -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || true)"
+          echo "previous_revision=$REV" >> "$GITHUB_OUTPUT"
+          echo "Current revision: ${REV:-none (first deployment)}"
+
+      - name: Deploy new image
+        id: deploy
+        env:
+          IMAGE_URI: ${{ needs.build-scan-push.outputs.image_uri }}
+        run: |
+          # From here on, a failure triggers the rollback step.
+          echo "started=true" >> "$GITHUB_OUTPUT"
+
+          kubectl apply -f kubernetes/namespace.yaml
+          kubectl apply -f kubernetes/configmap.yaml
+          kubectl apply -f kubernetes/service.yaml
+
+          # Render the real image into the manifest, then apply once.
+          sed "s|REPLACE_WITH_ECR_URI:REPLACE_WITH_IMAGE_TAG|${IMAGE_URI}|" \
+            kubernetes/deployment.yaml > /tmp/deployment.rendered.yaml
+          grep -q "$IMAGE_URI" /tmp/deployment.rendered.yaml
+          kubectl apply -f /tmp/deployment.rendered.yaml
+
+          kubectl rollout status deployment/cloudcart -n cloudcart --timeout=240s
+          kubectl get deployment,pods,svc -n cloudcart
+
+      - name: Verify application health from inside the cluster
+        run: |
+          kubectl run cloudcart-health-check-${{ github.run_id }} --rm -i --restart=Never \
+            --image=curlimages/curl:8.12.1 -n cloudcart -- \
+            curl --fail --retry 5 --retry-delay 2 http://cloudcart/health
+
+      - name: Roll back on failure
+        if: failure() && steps.deploy.outputs.started == 'true'
+        run: |
+          PREV="${{ steps.current.outputs.previous_revision }}"
+          echo "::group::Diagnostics"
+          kubectl get pods -n cloudcart -o wide || true
+          kubectl describe deployment cloudcart -n cloudcart | tail -40 || true
+          kubectl logs deployment/cloudcart -n cloudcart --tail=50 || true
+          echo "::endgroup::"
+
+          if [ -n "$PREV" ]; then
+            echo "Rolling back to revision $PREV"
+            kubectl rollout undo deployment/cloudcart -n cloudcart --to-revision="$PREV"
+            kubectl rollout status deployment/cloudcart -n cloudcart --timeout=300s
+            echo "::error::Deployment failed and was rolled back to revision $PREV."
+          else
+            echo "::error::First deployment failed and there is no earlier revision. Removing the broken deployment."
+            kubectl delete deployment cloudcart -n cloudcart --ignore-not-found
+          fi
