@@ -33,6 +33,16 @@ jobs:
         with:
           terraform_version: "1.10.5"
 
+      # TEMPORARY: prints the OIDC subject GitHub sends to AWS. Remove once the role works.
+      - name: Debug OIDC subject
+        run: |
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+          while [ $((${#PAYLOAD} % 4)) -ne 0 ]; do PAYLOAD="${PAYLOAD}="; done
+          echo "OIDC sub claim:"
+          echo "$PAYLOAD" | base64 -d | jq -r '.sub'
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
