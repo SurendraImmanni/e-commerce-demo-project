@@ -48,7 +48,7 @@ resource "aws_ecr_repository" "app" {
     encryption_type = "AES256"
   }
   force_delete = false
-  tags          = local.common_tags
+  tags         = local.common_tags
 }
 
 module "eks" {

@@ -1,0 +1,11 @@
+.env
+**/.env
+**/node_modules/
+**/coverage/
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate*
+terraform/tfplan
+terraform/*.tfvars
+terraform/backend.hcl
+trivy-results.sarif
